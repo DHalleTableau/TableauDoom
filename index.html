@@ -1,0 +1,147 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Doom Telemetry</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0e1117;--card:#161b24;--line:#1f2733;--mut:#8b95a5;--o:#e97627;--b:#4e79a7;--r:#e15759;--g:#59a14f;--y:#edc948}
+html,body{margin:0;height:100%;background:var(--bg);color:#e6e6e6;font:12px 'Segoe UI',Arial,sans-serif}
+#app{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(280px,1fr);gap:10px;padding:10px;height:calc(100% - 20px)}
+#game{display:flex;flex-direction:column;gap:6px;min-width:0}
+canvas#c{width:100%;aspect-ratio:8/5;image-rendering:pixelated;background:#000;border:2px solid var(--line);outline:none}
+canvas#c:focus{border-color:var(--o)}
+#side{display:grid;grid-template-rows:auto auto 1fr auto auto;overflow:auto;gap:8px;min-width:0}
+.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+h3{margin:0 0 6px;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--mut)}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;text-align:center}
+.kpi b{display:block;font-size:20px}.kpi span{color:var(--mut);font-size:10px}
+.btns button{background:#0a0d13;color:#e6e6e6;border:1px solid var(--line);border-radius:4px;padding:3px 8px;margin:2px 4px 2px 0;cursor:pointer;font-size:11px}.btns button:hover{border-color:var(--o)}
+.bar{height:10px;background:#0a0d13;border-radius:5px;overflow:hidden;margin:3px 0 7px}.bar i{display:block;height:100%;width:0;transition:width .3s}
+#map,#spark{width:100%;display:block;background:#0a0d13;border-radius:4px}
+#map{height:100%;min-height:150px}.mapcard{display:flex;flex-direction:column}.mapcard canvas{flex:1}
+#sync{display:none;color:var(--mut);font-size:11px;line-height:1.4}
+</style></head><body><div id="app">
+<div id="game"><canvas id="c" tabindex="0"></canvas><div id="hint" style="color:var(--mut)">Click the game · Arrows move · Ctrl fire · Space use · Shift run · 1-7 weapons</div></div>
+<div id="side">
+ <div class="card"><div class="kpis"><div class="kpi"><b id="kH">100</b><span>HEALTH</span></div><div class="kpi"><b id="kA">0</b><span>ARMOR</span></div><div class="kpi"><b id="kK">0/0</b><span>KILLS</span></div><div class="kpi"><b id="kT">0:00</b><span>TIME</span></div></div></div>
+ <div class="card"><h3>Vitals &amp; ammo</h3>
+  <div class="bar"><i id="bH" style="background:var(--r)"></i></div><div class="bar"><i id="bA" style="background:var(--b)"></i></div>
+  <div class="bar"><i id="bB" style="background:var(--y)"></i></div><div class="bar"><i id="bS" style="background:var(--o)"></i></div>
+  <canvas id="spark" height="60"></canvas></div>
+ <div class="card mapcard"><h3>Player track (map coordinates)</h3><canvas id="map"></canvas></div>
+ <div class="card btns"><h3>Session recorder</h3><div id="recinfo" style="color:var(--mut);margin-bottom:4px">0 samples · 0 events</div><button id="bS1">Download samples CSV</button><button id="bE1">Download events CSV</button><button id="bS2">Copy samples</button><button id="bE2">Copy events</button><button id="bR">New session</button><button id="bM">Sound: on</button><textarea id="fall" style="display:none;width:100%;height:70px;margin-top:4px;background:#0a0d13;color:#ccc;border:1px solid var(--line)"></textarea></div>
+ <div class="card" id="sync">Tableau parameter sync: starting…</div>
+</div></div>
+<script src="doom-audio.js"></script>
+<script src="doom-runtime.js"></script>
+<script>
+const $=id=>document.getElementById(id),cv=$('c');
+const PARAMS={DoomHealth:'health',DoomArmor:'armor',DoomKills:'kills',DoomItems:'items',DoomSecrets:'secrets',DoomX:'x',DoomY:'y',DoomAngle:'angle',DoomMap:'map',DoomBullets:'ammoBullets'};
+let tabParams={},syncNote='not running inside Tableau (standalone mode)';
+async function initTableau(){
+  try{
+    if(!(window.tableau&&tableau.extensions))return;
+    await tableau.extensions.initializeAsync();
+    const ps=await tableau.extensions.dashboardContent.dashboard.getParametersAsync();
+    ps.forEach(p=>{if(PARAMS[p.name])tabParams[p.name]=p;});
+    const n=Object.keys(tabParams).length;
+    syncNote=n?`Driving ${n} dashboard parameter(s): ${Object.keys(tabParams).join(', ')}`:'Running in Tableau. Add parameters named '+Object.keys(PARAMS).join(', ')+' to drive native viz.';
+  }catch(e){syncNote='Tableau init: '+e.message;}
+}
+let lastPush=0,pushing=false;
+async function push(t){
+  const now=performance.now();if(pushing||now-lastPush<1000)return;lastPush=now;pushing=true;
+  try{for(const[n,p]of Object.entries(tabParams)){const v=Math.round(t[PARAMS[n]]);await p.changeValueAsync(v);}}catch(e){syncNote='Sync error: '+e.message;}
+  pushing=false;
+}
+const trail=[],hist=[];let lastMap=-1;
+// ---------------- session recorder ----------------
+const WEAPONS=['Fist','Pistol','Shotgun','Chaingun','Rocket launcher','Plasma rifle','BFG 9000','Chainsaw','Super shotgun'];
+const SAMPLE_COLS=['session_id','sample','wall_seconds','level_seconds','episode','map','level','skill','health','armor','weapon_id','weapon','kills','total_kills','items','total_items','secrets','total_secrets','bullets','shells','cells','rockets','x','y','z','angle','damage_taking'];
+const EVENT_COLS=['session_id','event','level_seconds','wall_seconds','episode','map','level','event_type','detail','amount','health','armor','x','y'];
+const rec={sid:'',samples:[],events:[],prev:null,lastSample:0,start:0};
+function newSession(){rec.sid='S'+new Date().toISOString().replace(/[-:T]/g,'').slice(0,14);rec.samples=[];rec.events=[];rec.prev=null;rec.lastSample=0;rec.start=performance.now();trail.length=0;hist.length=0;try{$('recinfo').textContent='New session started: '+rec.sid+' · 0 samples · 0 events';$('fall').style.display='none';}catch(e){}}
+function ev(t,type,detail,amount){rec.events.push([rec.sid,rec.events.length+1,+(t.leveltime/35).toFixed(2),+((performance.now()-rec.start)/1000).toFixed(2),t.episode,t.map,'E'+t.episode+'M'+t.map,type,detail||'',amount===undefined?'':amount,t.health,t.armor,Math.round(t.x),Math.round(t.y)]);}
+function record(t){
+  if(t.gamestate!==0||t.demo){rec.prev=null;return;}
+  const p=rec.prev,now=performance.now();
+  if(!p||p.map!==t.map||p.episode!==t.episode||t.leveltime<p.leveltime-35){if(p&&(p.map!==t.map||p.episode!==t.episode)&&p.health>0)ev(p,'level_complete','E'+p.episode+'M'+p.map,Math.round(p.leveltime/35));ev(t,'level_start','E'+t.episode+'M'+t.map,'');}
+  else{
+    if(t.kills>p.kills)ev(t,'kill','',t.kills-p.kills);
+    if(t.health<p.health&&t.health>0)ev(t,'damage_taken','',p.health-t.health);
+    if(t.health<=0&&p.health>0)ev(t,'death','',0);
+    if(t.health>p.health)ev(t,'health_gain','',t.health-p.health);
+    if(t.armor>p.armor)ev(t,'armor_gain','',t.armor-p.armor);
+    if(t.weapon!==p.weapon)ev(t,'weapon_change',WEAPONS[t.weapon]||t.weapon,t.weapon);
+    const ap=p.ammoBullets+p.ammoShells+p.ammoCells+p.ammoRockets,an=t.ammoBullets+t.ammoShells+t.ammoCells+t.ammoRockets;
+    if(an>ap)ev(t,'ammo_pickup','',an-ap);
+    if(t.secrets>p.secrets)ev(t,'secret_found','',t.secrets-p.secrets);
+    else if(t.items>p.items)ev(t,'item_pickup','',t.items-p.items);
+  }
+  rec.prev=Object.assign({},t);
+  if(now-rec.lastSample>=500){rec.lastSample=now;
+    rec.samples.push([rec.sid,rec.samples.length+1,+((now-rec.start)/1000).toFixed(2),+(t.leveltime/35).toFixed(2),t.episode,t.map,'E'+t.episode+'M'+t.map,t.skill,t.health,t.armor,t.weapon,WEAPONS[t.weapon]||'',t.kills,t.totalkills,t.items,t.totalitems,t.secrets,t.totalsecrets,t.ammoBullets,t.ammoShells,t.ammoCells,t.ammoRockets,Math.round(t.x),Math.round(t.y),Math.round(t.z),Math.round(t.angle),t.damage>0?1:0]);}
+  $('recinfo').textContent=rec.sid+' · '+rec.samples.length+' samples · '+rec.events.length+' events';
+}
+const csv=(cols,rows)=>[cols.join(',')].concat(rows.map(r=>r.map(v=>/[",\n]/.test(v)?'"'+String(v).replace(/"/g,'""')+'"':v).join(','))).join('\n');
+function getCsv(kind){return kind==='s'?csv(SAMPLE_COLS,rec.samples):csv(EVENT_COLS,rec.events);}
+function download(kind){const name='doom_'+(kind==='s'?'samples':'events')+'_'+rec.sid+'.csv';
+  try{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([getCsv(kind)],{type:'text/csv'}));a.download=name;document.body.appendChild(a);a.click();a.remove();}catch(e){}
+  const f=$('fall');f.style.display='block';f.value=getCsv(kind);f.select();}
+async function copy(kind){const txt=getCsv(kind);try{await navigator.clipboard.writeText(txt);$('recinfo').textContent='Copied '+(kind==='s'?'samples':'events')+' CSV to clipboard';}catch(e){const f=$('fall');f.style.display='block';f.value=txt;f.select();$('recinfo').textContent='Clipboard blocked: select-all in the box below and copy';}}
+$('bS1').onclick=()=>download('s');$('bE1').onclick=()=>download('e');$('bS2').onclick=()=>copy('s');$('bE2').onclick=()=>copy('e');$('bR').onclick=newSession;
+newSession();
+
+function draw(t){
+  $('kH').textContent=t.health;$('kA').textContent=t.armor;$('kK').textContent=t.kills+'/'+t.totalkills;
+  const s=Math.floor(t.leveltime/35);$('kT').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+  $('bH').style.width=Math.min(100,Math.max(0,t.health))+'%';$('bA').style.width=Math.min(100,t.armor)+'%';
+  $('bB').style.width=Math.min(100,t.ammoBullets/200*100)+'%';$('bS').style.width=Math.min(100,t.ammoShells/50*100)+'%';
+  const mk=t.episode*10+t.map;if(mk!==lastMap){trail.length=0;hist.length=0;lastMap=mk;}
+  if(t.gamestate===0){const l=trail[trail.length-1];if(!l||Math.hypot(l[0]-t.x,l[1]-t.y)>16)trail.push([t.x,t.y]);if(trail.length>4000)trail.shift();
+    if(t.leveltime%35===0&&(!hist.length||hist[hist.length-1][0]!==t.leveltime))hist.push([t.leveltime,t.health,t.kills]);}
+  const m=$('map'),r=m.getBoundingClientRect();m.width=r.width;m.height=r.height;const c=m.getContext('2d');c.clearRect(0,0,m.width,m.height);
+  if(trail.length){let x0=1e9,x1=-1e9,y0=1e9,y1=-1e9;trail.forEach(([x,y])=>{x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y);});
+    const pad=200;x0-=pad;x1+=pad;y0-=pad;y1+=pad;const sc=Math.min(m.width/(x1-x0),m.height/(y1-y0)),ox=(m.width-(x1-x0)*sc)/2,oy=(m.height-(y1-y0)*sc)/2;
+    const P=([x,y])=>[ox+(x-x0)*sc,m.height-(oy+(y-y0)*sc)];
+    c.strokeStyle='#e97627';c.lineWidth=1.5;c.beginPath();trail.forEach((p,i)=>{const[a,b]=P(p);i?c.lineTo(a,b):c.moveTo(a,b);});c.stroke();
+    const[px,py]=P([t.x,t.y]),an=-t.angle*Math.PI/180;c.fillStyle='#fff';c.beginPath();c.arc(px,py,4,0,7);c.fill();
+    c.strokeStyle='#fff';c.beginPath();c.moveTo(px,py);c.lineTo(px+Math.cos(an)*14,py+Math.sin(an)*14);c.stroke();}
+  const sp=$('spark');sp.width=sp.getBoundingClientRect().width;const q=sp.getContext('2d');q.clearRect(0,0,sp.width,sp.height);
+  if(hist.length>1){const n=hist.length,X=i=>i/(n-1)*(sp.width-4)+2;
+    q.strokeStyle='#e15759';q.beginPath();hist.forEach((h,i)=>{const y=sp.height-4-h[1]/100*(sp.height-8);i?q.lineTo(X(i),y):q.moveTo(X(i),y);});q.stroke();
+    const mx=Math.max(1,t.totalkills);q.strokeStyle='#59a14f';q.beginPath();hist.forEach((h,i)=>{const y=sp.height-4-h[2]/mx*(sp.height-8);i?q.lineTo(X(i),y):q.moveTo(X(i),y);});q.stroke();}
+  $('sync').textContent='Tableau parameter sync: '+syncNote;
+}
+(async()=>{
+  const log=[];const stat=(m,bad)=>{log.push(m);const c=cv.getContext('2d');if(cv.width!==640){cv.width=640;cv.height=400;}
+    c.fillStyle='#000';c.fillRect(0,0,640,400);c.font='14px monospace';log.slice(-14).forEach((l,i)=>{c.fillStyle=/FAIL/.test(l)?'#e15759':'#9fd39f';c.fillText(l.slice(0,78),10,24+i*22);});};
+  window.addEventListener('error',e=>stat('FAIL js error: '+e.message));window.addEventListener('unhandledrejection',e=>stat('FAIL promise: '+(e.reason&&e.reason.message||e.reason)));
+  stat('page '+location.href.slice(0,70));stat('WebAssembly: '+(typeof WebAssembly)+' | tableau lib: '+(window.tableau?'yes':'NO'));
+  initTableau();
+  let w,a;
+  try{const r=await fetch('doom.wasm');stat('fetch doom.wasm -> '+r.status);w=await r.arrayBuffer();stat('wasm bytes '+w.byteLength);}catch(e){stat('FAIL fetch wasm: '+e.message);return;}
+  try{const r=await fetch('doom1.wad');stat('fetch doom1.wad -> '+r.status);a=await r.arrayBuffer();stat('wad bytes '+a.byteLength);}catch(e){stat('FAIL fetch wad: '+e.message);return;}
+  let g=null,waiting=false,muted=false;const ctx=cv.getContext('2d');
+  function ended(e){
+    const quit=e&&/doom exit|signature mismatch/.test(e.message||'');waiting=true;try{g&&g.audio&&g.audio.musicStop();}catch(x){}g=null;
+    cv.width=640;cv.height=400;ctx.fillStyle='#120606';ctx.fillRect(0,0,640,400);ctx.textAlign='center';
+    ctx.fillStyle='#e8301e';ctx.font='bold 34px monospace';ctx.fillText(quit?'YOU QUIT TO DOS':'GAME STOPPED',320,160);
+    ctx.fillStyle='#ccc';ctx.font='16px monospace';ctx.fillText('Your recorded session is kept.',320,205);ctx.fillText('Click here or press Enter to play again.',320,235);
+    if(!quit){ctx.fillStyle='#e15759';ctx.font='12px monospace';ctx.fillText(String(e&&e.message).slice(0,80),320,275);}
+    cv.focus();
+  }
+  async function boot(){
+    let my;try{my=await DoomRuntime.createDoom(w,a);stat('engine started');}catch(e){stat('FAIL engine: '+e.message);return;}
+    g=my;g.audio&&g.audio.mute(muted);cv.width=g.width;cv.height=g.height;const img=ctx.createImageData(g.width,g.height);ctx.textAlign='start';
+    rec.prev=null;let f=0;
+    (function loop(){if(g!==my)return;try{my.tick();}catch(e){ended(e);return;}
+      ctx.putImageData(my.frameRGBA(img),0,0);
+      if(++f%6===0){try{const t=my.telemetry();draw(t);record(t);push(t);}catch(e){}}requestAnimationFrame(loop);})();
+    cv.focus();
+  }
+  const act=e=>{if(!g){if(waiting&&e.type==='keydown'&&e.key==='Enter'){waiting=false;e.preventDefault();boot();}return;}
+    g.unlockAudio();const k=g.mapKey(e);if(k){g.key(e.type==='keydown',k);e.preventDefault();}};
+  cv.addEventListener('keydown',e=>{if(!e.repeat)act(e);else e.preventDefault();});cv.addEventListener('keyup',act);
+  cv.addEventListener('pointerdown',()=>{if(g)g.unlockAudio();else if(waiting){waiting=false;boot();}cv.focus();});
+  $('bM').onclick=()=>{muted=!muted;if(g&&g.audio)g.audio.mute(muted);$('bM').textContent='Sound: '+(muted?'off':'on');cv.focus();};
+  await boot();
+})().catch(e=>$('sync').textContent='Error: '+e.message);
+</script></body></html>
